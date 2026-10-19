@@ -63,6 +63,8 @@ final class MessengerMailer implements MailerInterface
         // After static enrichment took place, allow listeners to further manipulate message and envelope
         $event = new BeforeMailerSentMessageEvent($this, $message, $envelope);
         $this->eventDispatcher->dispatch($event);
+        $message = $event->getMessage();
+        $envelope = $event->getEnvelope();
 
         // The dispatched event here has `queued` set to `true`; the goal is NOT to render the message, but to let
         // listeners do something before a message is sent to the queue.
