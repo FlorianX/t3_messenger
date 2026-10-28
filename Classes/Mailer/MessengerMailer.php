@@ -39,7 +39,7 @@ final class MessengerMailer implements MailerInterface
 
     private MessageBusInterface $bus;
 
-    private ?SentMessage $sentMessage;
+    private ?SentMessage $sentMessage = null;
 
     public function __construct(
         MessageBusInterface $bus,
@@ -58,6 +58,7 @@ final class MessengerMailer implements MailerInterface
 
     public function send(RawMessage $message, ?Envelope $envelope = null): void
     {
+        $this->sentMessage = null;
         $this->mailValidityResolver->resolve($message);
 
         // After static enrichment took place, allow listeners to further manipulate message and envelope

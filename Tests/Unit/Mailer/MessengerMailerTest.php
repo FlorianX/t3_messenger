@@ -18,13 +18,20 @@ use Ssch\T3Messenger\Mailer\MailValidityResolver;
 use Ssch\T3Messenger\Mailer\MessengerMailer;
 use Symfony\Component\Mailer\Envelope;
 use Symfony\Component\Mailer\Event\MessageEvent;
+use Symfony\Component\Mailer\Exception\TransportException;
 use Symfony\Component\Mailer\Messenger\SendEmailMessage;
+use Symfony\Component\Mailer\SentMessage;
 use Symfony\Component\Mailer\Transport\TransportInterface;
 use Symfony\Component\Messenger\Envelope as MessengerEnvelope;
+use Symfony\Component\Messenger\Exception\HandlerFailedException;
 use Symfony\Component\Messenger\MessageBusInterface;
+use Symfony\Component\Messenger\Stamp\HandledStamp;
 use Symfony\Component\Mime\Address;
 use Symfony\Component\Mime\Email;
+use TYPO3\CMS\Core\Mail\Event\AfterMailerSentMessageEvent;
 use TYPO3\CMS\Core\Mail\Event\BeforeMailerSentMessageEvent;
+use TYPO3\CMS\Core\Mail\MailerInterface;
+use TYPO3\CMS\Core\Mail\MailMessage;
 
 final class MessengerMailerTest extends TestCase
 {
@@ -118,6 +125,147 @@ final class MessengerMailerTest extends TestCase
         $subject->send($message, $envelope);
 
         self::assertTrue($queuedEventDispatched);
+    }
+
+    public function testSentMessageIsNullBeforeSending(): void
+    {
+        $subject = $this->createMailer($this->createStub(MessageBusInterface::class));
+
+        self::assertNull($subject->getSentMessage());
+    }
+
+    public function testQueuedSendHasNoSentMessageIncludingInAfterEvent(): void
+    {
+        $message = $this->createEmail('Queued message', 'recipient@example.org');
+        $bus = $this->createMock(MessageBusInterface::class);
+        $bus->expects(self::once())->method('dispatch')->willReturn(new MessengerEnvelope(new SendEmailMessage($message)));
+        $afterEventDispatched = false;
+        $eventDispatcher = $this->createStub(EventDispatcherInterface::class);
+        $eventDispatcher->method('dispatch')->willReturnCallback(
+            static function (object $event) use (&$afterEventDispatched): object {
+                if ($event instanceof AfterMailerSentMessageEvent) {
+                    $afterEventDispatched = true;
+                    $mailer = $event->getMailer();
+                    self::assertInstanceOf(MailerInterface::class, $mailer);
+                    self::assertNull($mailer->getSentMessage());
+                }
+
+                return $event;
+            }
+        );
+        $subject = $this->createMailer($bus, $eventDispatcher);
+
+        $subject->send($message);
+
+        self::assertTrue($afterEventDispatched);
+        self::assertNull($subject->getSentMessage());
+    }
+
+    public function testSynchronousSendReturnsHandledResult(): void
+    {
+        $message = $this->createEmail('Synchronous message', 'recipient@example.org');
+        $sentMessage = new SentMessage($message, Envelope::create($message));
+        $bus = $this->createMock(MessageBusInterface::class);
+        $bus->expects(self::once())->method('dispatch')->willReturn(
+            new MessengerEnvelope(new SendEmailMessage($message), [new HandledStamp($sentMessage, 'mailer')])
+        );
+        $subject = $this->createMailer($bus);
+
+        $subject->send($message);
+
+        self::assertSame($sentMessage, $subject->getSentMessage());
+    }
+
+    public function testQueuedSendClearsPreviousSynchronousResult(): void
+    {
+        $message = $this->createEmail('Repeated message', 'recipient@example.org');
+        $sentMessage = new SentMessage($message, Envelope::create($message));
+        $bus = $this->createMock(MessageBusInterface::class);
+        $bus->expects(self::exactly(2))->method('dispatch')->willReturnOnConsecutiveCalls(
+            new MessengerEnvelope(new SendEmailMessage($message), [new HandledStamp($sentMessage, 'mailer')]),
+            new MessengerEnvelope(new SendEmailMessage($message))
+        );
+        $subject = $this->createMailer($bus);
+        $subject->send($message);
+        self::assertSame($sentMessage, $subject->getSentMessage());
+
+        $subject->send($message);
+
+        self::assertNull($subject->getSentMessage());
+    }
+
+    public function testFailedSendClearsPreviousResultAndPropagatesTransportException(): void
+    {
+        $message = $this->createEmail('Repeated message', 'recipient@example.org');
+        $sentMessage = new SentMessage($message, Envelope::create($message));
+        $failure = new TransportException('Transport failed');
+        $dispatchCalls = 0;
+        $bus = $this->createMock(MessageBusInterface::class);
+        $bus->expects(self::exactly(2))->method('dispatch')->willReturnCallback(
+            static function (object $queuedMessage) use ($sentMessage, $failure, &$dispatchCalls): MessengerEnvelope {
+                $envelope = new MessengerEnvelope($queuedMessage);
+                if (++$dispatchCalls === 1) {
+                    return $envelope->with(new HandledStamp($sentMessage, 'mailer'));
+                }
+
+                throw new HandlerFailedException($envelope, [$failure]);
+            }
+        );
+        $subject = $this->createMailer($bus);
+        $subject->send($message);
+        self::assertSame($sentMessage, $subject->getSentMessage());
+
+        try {
+            $subject->send($message);
+            self::fail('The transport exception must propagate.');
+        } catch (TransportException $exception) {
+            self::assertSame($failure, $exception);
+            self::assertNull($subject->getSentMessage());
+        }
+    }
+
+    public function testMailMessageSendQueuesWithoutReportingSynchronousDelivery(): void
+    {
+        $bus = $this->createMock(MessageBusInterface::class);
+        $bus->expects(self::once())->method('dispatch')->willReturnCallback(
+            static function (object $queuedMessage): MessengerEnvelope {
+                self::assertInstanceOf(SendEmailMessage::class, $queuedMessage);
+                $email = $queuedMessage->getMessage();
+                self::assertInstanceOf(Email::class, $email);
+                self::assertSame('Verification', $email->getSubject());
+
+                return new MessengerEnvelope($queuedMessage);
+            }
+        );
+        $message = new class($this->createMailer($bus)) extends MailMessage {
+            public function __construct(MailerInterface $mailer)
+            {
+                parent::__construct();
+                $this->mailer = $mailer;
+            }
+        };
+        $message->from('sender@example.org')
+            ->replyTo('reply@example.org')
+            ->to('recipient@example.org')
+            ->subject('Verification')
+            ->text('Verification link');
+
+        self::assertFalse($message->send());
+        self::assertFalse($message->isSent());
+    }
+
+    private function createMailer(
+        MessageBusInterface $bus,
+        ?EventDispatcherInterface $eventDispatcher = null
+    ): MessengerMailer {
+        if ($eventDispatcher === null) {
+            $eventDispatcher = $this->createStub(EventDispatcherInterface::class);
+            $eventDispatcher->method('dispatch')->willReturnArgument(0);
+        }
+        $transport = $this->createStub(TransportInterface::class);
+        $transport->method('__toString')->willReturn('null://');
+
+        return new MessengerMailer($bus, new MailValidityResolver(), $eventDispatcher, $transport, $transport);
     }
 
     private function createEmail(string $subject, string $recipient): Email
